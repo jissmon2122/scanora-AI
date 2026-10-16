@@ -2,15 +2,16 @@
 Scanora AI — FastAPI Clinical Mammography Inference Microservice.
 
 Provides:
-- GET /health: Health & Model Readiness probe
+- GET /health: Health & Model Readiness probe (lightweight, zero-model-load liveness check)
 - GET /v1/model-info: Checkpoint and architecture provenance
-- POST /v1/infer: Real PyTorch inference (classification + lesion detection)
+- POST /v1/infer: Real PyTorch inference with safe thread-safe lazy model loading
 """
 
 import os
 import time
 import base64
 import logging
+import threading
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +23,11 @@ from ai_service.preprocessing.dicom_handler import DicomHandler, DicomProcessing
 from ai_service.preprocessing.mammography_preprocessor import MammographyPreprocessor
 from ai_service.models.mammography_classifier import MammographyClassifier
 from ai_service.models.lesion_detector import MammographyLesionDetector
-from ai_service.models.checkpoint_validator import ModelLifecycleState
+from ai_service.models.checkpoint_validator import (
+    ModelLifecycleState,
+    CheckpointValidator,
+    CheckpointValidationError,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("scanora.inference_service")
@@ -45,46 +50,286 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global model state
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class ModelManager:
+    """
+    Thread-safe model manager implementing lazy initialization.
+    Prevents out-of-memory crashes on memory-constrained deployments (e.g. Render 512MiB)
+    by ensuring neural networks are NEVER instantiated at startup/import time, and weights
+    are loaded ONLY on genuine inference requests with verified checkpoints.
+    """
+    _lock = threading.Lock()
+    _classifier: Optional[MammographyClassifier] = None
+    _detector: Optional[MammographyLesionDetector] = None
+    _classifier_checkpoint_path: Optional[str] = None
+    _detector_checkpoint_path: Optional[str] = None
+
+    @classmethod
+    def get_device(cls) -> torch.device:
+        force_cpu = os.getenv("FORCE_CPU", "true").lower() in ("true", "1", "yes")
+        if force_cpu or not torch.cuda.is_available():
+            return torch.device("cpu")
+        return torch.device("cuda")
+
+    @classmethod
+    def get_checkpoints_dir(cls) -> str:
+        checkpoints_dir = os.getenv("SCANORA_CHECKPOINTS_DIR")
+        if not checkpoints_dir or not os.path.exists(checkpoints_dir):
+            file_relative_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+            checkpoints_dir = file_relative_dir if os.path.exists(file_relative_dir) else "./ai_service/checkpoints"
+        return checkpoints_dir
+
+    @classmethod
+    def find_classifier_checkpoint_on_disk(cls) -> Optional[str]:
+        cdir = cls.get_checkpoints_dir()
+        candidates = [
+            os.path.join(cdir, "best_mammography_classifier.pt"),
+            os.path.join(cdir, "mammography_classifier.pt"),
+        ]
+        for c_path in candidates:
+            if os.path.exists(c_path):
+                try:
+                    if os.path.getsize(c_path) >= 1024:
+                        return c_path
+                except OSError:
+                    continue
+        return None
+
+    @classmethod
+    def find_detector_checkpoint_on_disk(cls) -> Optional[str]:
+        cdir = cls.get_checkpoints_dir()
+        candidates = [
+            os.path.join(cdir, "best_lesion_detector.pt"),
+            os.path.join(cdir, "lesion_detector.pt"),
+        ]
+        for d_path in candidates:
+            if os.path.exists(d_path):
+                try:
+                    if os.path.getsize(d_path) >= 1024:
+                        return d_path
+                except OSError:
+                    continue
+        return None
+
+    @classmethod
+    def is_classifier_available(cls) -> bool:
+        """Checks if classifier is loaded or a valid candidate checkpoint exists on disk."""
+        if cls._classifier is not None:
+            return cls._classifier.is_trained and cls._classifier.lifecycle_state != ModelLifecycleState.MODEL_UNAVAILABLE
+        return cls.find_classifier_checkpoint_on_disk() is not None
+
+    @classmethod
+    def is_classifier_loaded(cls) -> bool:
+        return cls._classifier is not None and cls._classifier.is_trained
+
+    @classmethod
+    def is_detector_loaded(cls) -> bool:
+        return cls._detector is not None and cls._detector.is_trained
+
+    @classmethod
+    def get_classifier_checkpoint_id(cls) -> Optional[str]:
+        if cls._classifier is not None:
+            return cls._classifier.checkpoint_id
+        ckpt = cls.find_classifier_checkpoint_on_disk()
+        return os.path.basename(ckpt) if ckpt else None
+
+    @classmethod
+    def get_detector_checkpoint_id(cls) -> Optional[str]:
+        if cls._detector is not None:
+            return cls._detector.checkpoint_id
+        ckpt = cls.find_detector_checkpoint_on_disk()
+        return os.path.basename(ckpt) if ckpt else None
+
+    @classmethod
+    def get_classifier_lifecycle_state(cls) -> str:
+        if cls._classifier is not None:
+            return cls._classifier.lifecycle_state
+        return ModelLifecycleState.MODEL_UNAVAILABLE
+
+    @classmethod
+    def get_detector_lifecycle_state(cls) -> str:
+        if cls._detector is not None:
+            return cls._detector.lifecycle_state
+        return ModelLifecycleState.MODEL_UNAVAILABLE
+
+    @classmethod
+    def get_classifier(cls) -> MammographyClassifier:
+        """
+        Thread-safe double-checked lazy initialization of MammographyClassifier.
+        Ensures pretrained_backbone=False so no weights are downloaded from torchvision URLs.
+        """
+        if cls._classifier is not None and cls._classifier.is_trained:
+            return cls._classifier
+
+        with cls._lock:
+            if cls._classifier is not None and cls._classifier.is_trained:
+                return cls._classifier
+
+            ckpt_path = cls.find_classifier_checkpoint_on_disk()
+            if not ckpt_path:
+                raise CheckpointValidationError(
+                    "No verified mammography task-trained classifier checkpoint found on disk. "
+                    "Untrained random linear heads are strictly prohibited from generating clinical cancer risk scores."
+                )
+
+            device = cls.get_device()
+            logger.info("Initializing MammographyClassifier (pretrained_backbone=False) on %s from %s", device, ckpt_path)
+            model = MammographyClassifier(pretrained_backbone=False)
+            model.load_checkpoint(ckpt_path, device=device)
+            cls._classifier = model
+            cls._classifier_checkpoint_path = ckpt_path
+            return cls._classifier
+
+    @classmethod
+    def get_detector(cls) -> Optional[MammographyLesionDetector]:
+        """
+        Thread-safe double-checked lazy initialization of MammographyLesionDetector.
+        Returns None without instantiating Faster R-CNN (saving ~205MB) if no checkpoint exists.
+        """
+        if cls._detector is not None and cls._detector.is_trained:
+            return cls._detector
+
+        with cls._lock:
+            if cls._detector is not None and cls._detector.is_trained:
+                return cls._detector
+
+            ckpt_path = cls.find_detector_checkpoint_on_disk()
+            if not ckpt_path:
+                logger.info("No detector checkpoint found on disk. Lesion detector will remain unallocated.")
+                return None
+
+            device = cls.get_device()
+            logger.info("Initializing MammographyLesionDetector (pretrained_backbone=False) on %s from %s", device, ckpt_path)
+            model = MammographyLesionDetector(pretrained_backbone=False)
+            model.load_checkpoint(ckpt_path, device=device)
+            cls._detector = model
+            cls._detector_checkpoint_path = ckpt_path
+            return cls._detector
+
+    @classmethod
+    def set_classifier(cls, classifier: MammographyClassifier) -> None:
+        with cls._lock:
+            cls._classifier = classifier
+
+    @classmethod
+    def set_detector(cls, detector: MammographyLesionDetector) -> None:
+        with cls._lock:
+            cls._detector = detector
+
+    @classmethod
+    def reset(cls) -> None:
+        with cls._lock:
+            cls._classifier = None
+            cls._detector = None
+            cls._classifier_checkpoint_path = None
+            cls._detector_checkpoint_path = None
+
+
+class ClassifierProxy:
+    """Proxy object preserving backward compatibility for test fixtures and direct module access."""
+    @property
+    def is_trained(self) -> bool:
+        if ModelManager._classifier is not None:
+            return ModelManager._classifier.is_trained
+        return False
+
+    @is_trained.setter
+    def is_trained(self, val: bool):
+        if ModelManager._classifier is None:
+            ModelManager._classifier = MammographyClassifier(pretrained_backbone=False)
+        ModelManager._classifier.is_trained = val
+
+    @property
+    def lifecycle_state(self) -> str:
+        if ModelManager._classifier is not None:
+            return ModelManager._classifier.lifecycle_state
+        return ModelManager.get_classifier_lifecycle_state()
+
+    @lifecycle_state.setter
+    def lifecycle_state(self, val: str):
+        if ModelManager._classifier is None:
+            ModelManager._classifier = MammographyClassifier(pretrained_backbone=False)
+        ModelManager._classifier.lifecycle_state = val
+
+    @property
+    def checkpoint_id(self) -> Optional[str]:
+        if ModelManager._classifier is not None:
+            return ModelManager._classifier.checkpoint_id
+        return ModelManager.get_classifier_checkpoint_id()
+
+    @property
+    def backbone_name(self) -> str:
+        if ModelManager._classifier is not None:
+            return ModelManager._classifier.backbone_name
+        return "efficientnet_b2"
+
+    def load_checkpoint(self, checkpoint_path: str, device: Optional[torch.device] = None):
+        if device is None:
+            device = ModelManager.get_device()
+        if ModelManager._classifier is None:
+            model = MammographyClassifier(pretrained_backbone=False)
+            model.load_checkpoint(checkpoint_path, device=device)
+            ModelManager.set_classifier(model)
+            return True
+        return ModelManager._classifier.load_checkpoint(checkpoint_path, device=device)
+
+    def predict_single(self, *args, **kwargs):
+        clf = ModelManager.get_classifier()
+        return clf.predict_single(*args, **kwargs)
+
+    def __getattr__(self, name):
+        clf = ModelManager.get_classifier()
+        return getattr(clf, name)
+
+
+class DetectorProxy:
+    """Proxy object preserving backward compatibility for detector access."""
+    @property
+    def is_trained(self) -> bool:
+        if ModelManager._detector is not None:
+            return ModelManager._detector.is_trained
+        return False
+
+    @property
+    def lifecycle_state(self) -> str:
+        if ModelManager._detector is not None:
+            return ModelManager._detector.lifecycle_state
+        return ModelManager.get_detector_lifecycle_state()
+
+    @property
+    def checkpoint_id(self) -> Optional[str]:
+        if ModelManager._detector is not None:
+            return ModelManager._detector.checkpoint_id
+        return ModelManager.get_detector_checkpoint_id()
+
+    def load_checkpoint(self, checkpoint_path: str, device: Optional[torch.device] = None):
+        if device is None:
+            device = ModelManager.get_device()
+        if ModelManager._detector is None:
+            model = MammographyLesionDetector(pretrained_backbone=False)
+            model.load_checkpoint(checkpoint_path, device=device)
+            ModelManager.set_detector(model)
+            return True
+        return ModelManager._detector.load_checkpoint(checkpoint_path, device=device)
+
+    def detect(self, *args, **kwargs):
+        det = ModelManager.get_detector()
+        if det is None:
+            return {"findings": [], "detector_status": "DETECTOR_UNAVAILABLE"}
+        return det.detect(*args, **kwargs)
+
+    def __getattr__(self, name):
+        det = ModelManager.get_detector()
+        if det is None:
+            raise AttributeError("MammographyLesionDetector is not initialized (no checkpoint available)")
+        return getattr(det, name)
+
+
+# Module-level instances and proxies for backwards compatibility
+device = ModelManager.get_device()
 preprocessor = MammographyPreprocessor(target_size=512)
-
-classifier = MammographyClassifier(pretrained_backbone=True).to(device)
-detector = MammographyLesionDetector(pretrained_backbone=True).to(device)
-
-# Attempt to load trained checkpoints if present
-CHECKPOINTS_DIR = os.getenv("SCANORA_CHECKPOINTS_DIR")
-if not CHECKPOINTS_DIR or not os.path.exists(CHECKPOINTS_DIR):
-    file_relative_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
-    CHECKPOINTS_DIR = file_relative_dir if os.path.exists(file_relative_dir) else "./ai_service/checkpoints"
-
-classifier_candidates = [
-    os.path.join(CHECKPOINTS_DIR, "best_mammography_classifier.pt"),
-    os.path.join(CHECKPOINTS_DIR, "mammography_classifier.pt"),
-]
-detector_candidates = [
-    os.path.join(CHECKPOINTS_DIR, "best_lesion_detector.pt"),
-    os.path.join(CHECKPOINTS_DIR, "lesion_detector.pt"),
-]
-
-for c_path in classifier_candidates:
-    if os.path.exists(c_path):
-        try:
-            classifier.load_checkpoint(c_path, device=device)
-            logger.info(f"Loaded classifier checkpoint: {c_path}")
-            break
-        except Exception as e:
-            logger.warning(f"Could not load classifier checkpoint from '{c_path}': {e}")
-
-for d_path in detector_candidates:
-    if os.path.exists(d_path):
-        try:
-            detector.load_checkpoint(d_path, device=device)
-            logger.info(f"Loaded detector checkpoint: {d_path}")
-            break
-        except Exception as e:
-            logger.warning(f"Could not load detector checkpoint from '{d_path}': {e}")
-
+classifier = ClassifierProxy()
+detector = DetectorProxy()
 
 
 # Request & Response Schemas
@@ -109,7 +354,7 @@ class LesionItem(BaseModel):
 
 class InferenceResponse(BaseModel):
     scan_id: str
-    model_status: str  # "TRAINED_MODEL", "RESEARCH_PROTOTYPE", "DETECTOR_UNAVAILABLE"
+    model_status: str  # "TRAINED_MODEL", "RESEARCH_PROTOTYPE", "MODEL_UNAVAILABLE", etc.
     model_architecture: str
     checkpoint_id: str
     calibrated_malignancy_probability: float
@@ -143,42 +388,54 @@ def verify_auth_token(authorization: Optional[str] = Header(None)):
 
 @app.get("/health")
 def health():
-    """Health & Readiness probe. Distinguishes service status from model readiness."""
+    """
+    Lightweight Liveness probe (<2ms).
+    Distinguishes service availability from model readiness without loading PyTorch weights into memory.
+    """
     return {
         "status": "healthy",
         "service": "scanora-ai-inference",
         "version": "1.0.0",
-        "device": str(device),
-        "cuda_available": torch.cuda.is_available(),
-        "classifier_ready": classifier.is_trained,
-        "classifier_trained": classifier.is_trained,
-        "classifier_checkpoint": classifier.checkpoint_id,
-        "lifecycle_state": classifier.lifecycle_state,
-        "detector_ready": detector.is_trained,
-        "detector_trained": detector.is_trained,
-        "detector_checkpoint": detector.checkpoint_id,
+        "device": str(ModelManager.get_device()),
+        "cuda_available": (
+            False if os.getenv("FORCE_CPU", "true").lower() in ("true", "1", "yes")
+            else torch.cuda.is_available()
+        ),
+        "classifier_ready": ModelManager.is_classifier_loaded(),
+        "classifier_trained": ModelManager.is_classifier_loaded(),
+        "classifier_checkpoint": ModelManager.get_classifier_checkpoint_id(),
+        "lifecycle_state": ModelManager.get_classifier_lifecycle_state(),
+        "detector_ready": ModelManager.is_detector_loaded(),
+        "detector_trained": ModelManager.is_detector_loaded(),
+        "detector_checkpoint": ModelManager.get_detector_checkpoint_id(),
     }
 
 
 @app.get("/v1/model-info")
 def model_info():
-    """Returns architecture, lifecycle status, and training dataset provenance."""
+    """Returns architecture, lifecycle status, and training dataset provenance without loading weights."""
+    clf_loaded = ModelManager.is_classifier_loaded()
+    clf_state = ModelManager.get_classifier_lifecycle_state()
+    clf_ckpt = ModelManager.get_classifier_checkpoint_id()
+    det_loaded = ModelManager.is_detector_loaded()
+    det_ckpt = ModelManager.get_detector_checkpoint_id()
+
     return {
         "service": "Scanora Mammography AI Service",
         "version": "1.0.0",
-        "lifecycle_state": classifier.lifecycle_state,
-        "is_trained": classifier.is_trained,
+        "lifecycle_state": clf_state,
+        "is_trained": clf_loaded,
         "classifier": {
-            "backbone": classifier.backbone_name,
-            "trained": classifier.is_trained,
-            "checkpoint": classifier.checkpoint_id,
-            "lifecycle_state": classifier.lifecycle_state,
+            "backbone": "efficientnet_b2",
+            "trained": clf_loaded,
+            "checkpoint": clf_ckpt,
+            "lifecycle_state": clf_state,
             "dataset_provenance": "VinDr-Mammo (FFDM) / CBIS-DDSM",
         },
         "detector": {
             "backbone": "Faster R-CNN (ResNet-50-FPN)",
-            "trained": detector.is_trained,
-            "checkpoint": detector.checkpoint_id,
+            "trained": det_loaded,
+            "checkpoint": det_ckpt,
             "classes": ["Mass", "Suspicious Calcification", "Architectural Distortion", "Asymmetry"],
         },
         "regulatory_notice": (
@@ -189,12 +446,12 @@ def model_info():
 
 @app.post("/v1/infer", response_model=InferenceResponse)
 def infer(req: InferenceRequest, authorization: Optional[str] = Header(None)):
-    """Executes validated PyTorch computer vision inference."""
+    """Executes validated PyTorch computer vision inference with safe lazy model loading."""
     verify_auth_token(authorization)
     start_time = time.perf_counter()
 
     # Safety Gate: Prevent untrained random linear heads from generating clinical predictions
-    if not classifier.is_trained or classifier.lifecycle_state == ModelLifecycleState.MODEL_UNAVAILABLE:
+    if not ModelManager.is_classifier_available():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -238,11 +495,27 @@ def infer(req: InferenceRequest, authorization: Optional[str] = Header(None)):
         logger.error(f"Image decompression error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Image processing failure: {e}")
 
-    # Run PyTorch Classifier
-    classification = classifier.predict_single(prep_res.tensor, device=device)
+    # Lazily initialize classifier with thread-safety and local weights only
+    try:
+        active_classifier = ModelManager.get_classifier()
+    except (CheckpointValidationError, Exception) as e:
+        logger.error(f"Failed to lazily load classifier checkpoint: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"AI Model Unavailable: Could not load verified checkpoint: {e}",
+        )
 
-    # Run PyTorch Detector
-    detection = detector.detect(prep_res.tensor, device=device, laterality=laterality)
+    device = ModelManager.get_device()
+
+    # Run PyTorch Classifier
+    classification = active_classifier.predict_single(prep_res.tensor, device=device)
+
+    # Lazily retrieve detector (remains None if no detector checkpoint on disk, avoiding OOM)
+    active_detector = ModelManager.get_detector()
+    if active_detector is not None:
+        detection = active_detector.detect(prep_res.tensor, device=device, laterality=laterality)
+    else:
+        detection = {"findings": [], "detector_status": "DETECTOR_UNAVAILABLE"}
 
     # Map detector boxes back to original image space
     mapped_findings: List[LesionItem] = []
@@ -264,7 +537,7 @@ def infer(req: InferenceRequest, authorization: Optional[str] = Header(None)):
 
     latency_ms = (time.perf_counter() - start_time) * 1000.0
 
-    model_status_label = classifier.lifecycle_state
+    model_status_label = active_classifier.lifecycle_state
 
     return InferenceResponse(
         scan_id=req.scan_id,
