@@ -6,6 +6,7 @@ import {
   LesionFindingSchema,
   AnalyzeRequestSchema,
   ScanRecordSchema,
+  ModelStatusSchema,
 } from "../src/shared/types.ts";
 
 test("BiradsCategorySchema validates ACR BI-RADS standard categories", () => {
@@ -95,4 +96,19 @@ test("ScanRecordSchema validates full scan entity with analysis", () => {
   const parsed = ScanRecordSchema.parse(record);
   assert.equal(parsed.analysis?.biradsCategory, "BI-RADS 2");
   assert.equal(parsed.analysis?.malignancyScore, 2.1);
+});
+
+test("ModelStatusSchema enforces valid AI transparency statuses", () => {
+  const validStatuses = [
+    "TRAINED_MODEL",
+    "RESEARCH_PROTOTYPE",
+    "SIMULATED_DEMO",
+    "MODEL_UNAVAILABLE",
+  ];
+  for (const status of validStatuses) {
+    assert.equal(ModelStatusSchema.parse(status), status);
+  }
+
+  assert.throws(() => ModelStatusSchema.parse("PROD_CERTIFIED"));
+  assert.throws(() => ModelStatusSchema.parse("UNKNOWN"));
 });

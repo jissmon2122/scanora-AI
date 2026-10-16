@@ -22,8 +22,20 @@ import {
   Calendar,
   Layers,
   Sparkles,
+  Cpu,
+  Clock,
+  Database,
+  FileCode,
+  ShieldAlert,
 } from "lucide-react";
-import type { ScanRecord, AnalysisResult, BiradsCategory, Laterality, MammographyView } from "@/shared/types";
+import type {
+  ScanRecord,
+  AnalysisResult,
+  BiradsCategory,
+  Laterality,
+  MammographyView,
+  ModelStatus,
+} from "@/shared/types";
 
 export default function Home() {
   const { user, logout, isPending } = useAuth();
@@ -42,11 +54,13 @@ export default function Home() {
   const [laterality, setLaterality] = useState<Laterality>("right");
   const [view, setView] = useState<MammographyView>("MLO");
   const [clinicalNotes, setClinicalNotes] = useState("");
+  const [allowDemoFallback, setAllowDemoFallback] = useState(true);
 
   // Analysis State
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [currentAnalysis, setCurrentAnalysis] = useState<AnalysisResult | null>(null);
   const [activeScanRecord, setActiveScanRecord] = useState<ScanRecord | null>(null);
+  const [deletingScanId, setDeletingScanId] = useState<string | null>(null);
 
   // Image Viewer Controls
   const [zoomLevel, setZoomLevel] = useState(1);
@@ -183,6 +197,7 @@ export default function Home() {
         fileName: selectedFile.name,
         fileSize: selectedFile.size,
         fileDataUrl: fileDataUrl || undefined,
+        allowDemoFallback,
         patientInfo: {
           patientId: patientId.trim() || undefined,
           age: typeof patientAge === "number" ? patientAge : undefined,
@@ -251,18 +266,59 @@ export default function Home() {
     setIsHistoryOpen(false);
   };
 
-  const handleDeleteScan = async (scanId: string, e: React.MouseEvent) => {
+  const handleDeleteClick = (scanId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    setDeletingScanId(scanId);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deletingScanId) return;
     try {
-      const res = await fetch(`/api/scans/${scanId}`, { method: "DELETE" });
+      const res = await fetch(`/api/scans/${deletingScanId}`, { method: "DELETE" });
       if (res.ok) {
-        setScanHistory((prev) => prev.filter((s) => s.id !== scanId));
-        if (activeScanRecord?.id === scanId) {
+        setScanHistory((prev) => prev.filter((s) => s.id !== deletingScanId));
+        if (activeScanRecord?.id === deletingScanId) {
           handleClear();
         }
       }
     } catch (err) {
       console.warn("Delete error:", err);
+    } finally {
+      setDeletingScanId(null);
+    }
+  };
+
+  const getModelStatusBadge = (status?: ModelStatus) => {
+    switch (status) {
+      case "TRAINED_MODEL":
+        return {
+          bg: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
+          dot: "bg-emerald-400 animate-pulse",
+          label: "Live AI Model (Trained)",
+          description: "Inference executed via local PyTorch microservice with trained weights.",
+        };
+      case "RESEARCH_PROTOTYPE":
+        return {
+          bg: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
+          dot: "bg-cyan-400",
+          label: "Research Prototype (Inference Active)",
+          description: "Pre-clinical deep learning model (EfficientNet-B2 + Faster R-CNN).",
+        };
+      case "SIMULATED_DEMO":
+        return {
+          bg: "bg-amber-500/15 text-amber-300 border-amber-500/30",
+          dot: "bg-amber-400",
+          label: "Demonstration / Simulation Mode",
+          description: "Deterministic clinical simulation (PyTorch inference service inactive).",
+        };
+      case "MODEL_UNAVAILABLE":
+      default:
+        return {
+          bg: "bg-rose-500/15 text-rose-300 border-rose-500/30",
+          dot: "bg-rose-400",
+          label: "AI Model Unavailable",
+          description: "Inference service offline or model weights missing.",
+        };
     }
   };
 
@@ -398,6 +454,22 @@ export default function Home() {
         </div>
       </header>
 
+      {/* Research Prototype Alert Banner */}
+      <div className="bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-cyan-500/10 border-b border-amber-500/20 px-4 py-2.5 text-xs text-amber-200">
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <ShieldAlert className="w-4 h-4 text-amber-400 flex-shrink-0" />
+            <span className="leading-snug">
+              <strong className="text-amber-300">Investigational Research System:</strong> Scanora is an experimental computer-aided decision-support system trained on open mammography benchmarks (VinDr-Mammo & CBIS-DDSM). Not cleared for primary clinical diagnosis or independent triage. Requires review by a qualified radiologist.
+            </span>
+          </div>
+          <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[11px] font-semibold whitespace-nowrap">
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+            Research Prototype
+          </span>
+        </div>
+      </div>
+
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Left Column: Image Viewer / Upload Dropzone */}
@@ -487,11 +559,34 @@ export default function Home() {
                       }`,
                     }}
                   >
-                    <img
-                      src={previewUrl}
-                      alt="Mammography Scan Preview"
-                      className="max-h-[460px] w-auto object-contain rounded"
-                    />
+                    {selectedFile?.name.toLowerCase().endsWith(".dcm") ? (
+                      <div className="flex flex-col items-center justify-center p-8 text-center max-w-sm">
+                        <div className="w-16 h-16 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center mb-4">
+                          <FileCode className="w-8 h-8 text-cyan-400" />
+                        </div>
+                        <h4 className="text-sm font-semibold text-white mb-1">
+                          DICOM Mammogram Loaded
+                        </h4>
+                        <p className="text-[11px] text-slate-400 mb-3 font-mono">
+                          {selectedFile.name} ({(selectedFile.size / 1024 / 1024).toFixed(2)} MB)
+                        </p>
+                        <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-300 space-y-1.5 text-left">
+                          <div className="flex items-center gap-1.5 text-cyan-300 font-medium">
+                            <Layers className="w-3.5 h-3.5" />
+                            <span>16-Bit Grayscale Dynamic Range</span>
+                          </div>
+                          <p className="text-[10px] text-slate-400 leading-relaxed">
+                            Preprocessed server-side via PyDicom: VOI LUT windowing, MONOCHROME1 inversion, and anatomical aspect ratio preservation.
+                          </p>
+                        </div>
+                      </div>
+                    ) : (
+                      <img
+                        src={previewUrl}
+                        alt="Mammography Scan Preview"
+                        className="max-h-[460px] w-auto object-contain rounded"
+                      />
+                    )}
 
                     {/* AI Findings ROI Bounding Box Overlay */}
                     {showRoiOverlay &&
@@ -686,6 +781,20 @@ export default function Home() {
               />
             </div>
 
+            <div className="mb-4 pt-2 border-t border-slate-800/60 flex items-center justify-between text-xs">
+              <label htmlFor="demo-fallback" className="text-slate-300 flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  id="demo-fallback"
+                  type="checkbox"
+                  checked={allowDemoFallback}
+                  onChange={(e) => setAllowDemoFallback(e.target.checked)}
+                  className="rounded border-slate-700 bg-slate-950 text-cyan-500 focus:ring-cyan-500 w-4 h-4 cursor-pointer"
+                />
+                <span className="font-medium">Allow simulation fallback if AI engine is offline</span>
+              </label>
+              <span className="text-[10px] text-slate-500">Explicit Mode</span>
+            </div>
+
             {/* Run Analysis Action Button */}
             <button
               onClick={handleAnalyze}
@@ -729,6 +838,53 @@ export default function Home() {
                   );
                 })()}
               </div>
+
+              {/* Model Status & Checkpoint Telemetry */}
+              {(() => {
+                const statusBadge = getModelStatusBadge(currentAnalysis.modelStatus);
+                return (
+                  <div className="p-3.5 bg-slate-950/80 rounded-xl border border-slate-800/80 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-semibold ${statusBadge.bg}`}>
+                          <span className={`w-2 h-2 rounded-full ${statusBadge.dot}`} />
+                          {statusBadge.label}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                        {currentAnalysis.inferenceLatencyMs !== undefined && (
+                          <span className="flex items-center gap-1 bg-slate-900 px-2 py-0.5 rounded border border-slate-800 font-mono">
+                            <Clock className="w-3 h-3 text-cyan-400" />
+                            {currentAnalysis.inferenceLatencyMs}ms
+                          </span>
+                        )}
+                        {currentAnalysis.checkpointId && (
+                          <span className="flex items-center gap-1 bg-slate-900 px-2 py-0.5 rounded border border-slate-800 font-mono text-[10px]">
+                            <Database className="w-3 h-3 text-teal-400" />
+                            {currentAnalysis.checkpointId}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {currentAnalysis.modelArchitecture && (
+                      <div className="text-[11px] text-slate-400 flex items-center gap-1.5 pt-1.5 border-t border-slate-800/60">
+                        <Cpu className="w-3.5 h-3.5 text-slate-500" />
+                        <span>Architecture: <strong className="text-slate-300 font-medium">{currentAnalysis.modelArchitecture}</strong></span>
+                      </div>
+                    )}
+
+                    {currentAnalysis.modelStatus === "MODEL_UNAVAILABLE" && (
+                      <div className="mt-2 p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs">
+                        <strong>AI Inference Service Offline:</strong> The backend PyTorch engine could not be reached. To enable genuine AI analysis, start the microservice via:
+                        <code className="block mt-1 font-mono text-[10px] text-rose-200 bg-rose-950/50 p-1.5 rounded border border-rose-900/40">
+                          ai_service\.venv\Scripts\python.exe -m uvicorn ai_service.main:app --port 8000
+                        </code>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* Assessment Description */}
               <div className="p-3.5 bg-slate-950/80 rounded-xl border border-slate-800/80 text-xs">
@@ -908,7 +1064,7 @@ export default function Home() {
                           </span>
                         )}
                         <button
-                          onClick={(e) => handleDeleteScan(scan.id, e)}
+                          onClick={(e) => handleDeleteClick(scan.id, e)}
                           className="text-slate-400 hover:text-rose-400 p-1 rounded transition-colors"
                           title="Delete Case"
                         >
@@ -925,6 +1081,40 @@ export default function Home() {
                   </div>
                 ))
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {deletingScanId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-sm w-full shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center gap-3 mb-4 text-rose-400">
+              <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/20">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-white text-base">Delete Scan Record</h3>
+                <p className="text-xs text-slate-400">Permanently purge case file</p>
+              </div>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed mb-6">
+              Are you sure you want to delete case <strong className="text-white font-mono">{deletingScanId}</strong>? This will permanently delete the study, AI findings, and all associated files from Cloudflare D1 and R2 storage.
+            </p>
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => setDeletingScanId(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 text-xs font-semibold rounded-lg transition-colors border border-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmDelete}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold rounded-lg shadow-lg shadow-rose-600/20 transition-colors"
+              >
+                Confirm Delete
+              </button>
             </div>
           </div>
         </div>

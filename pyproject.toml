@@ -1,0 +1,10 @@
+[project]
+name = "scanora-ai"
+version = "1.0.0"
+description = "Scanora Research-Grade AI Mammography Analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["ai_service/tests"]

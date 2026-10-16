@@ -13,7 +13,9 @@
   },
   "vars": {
     "MOCHA_USERS_SERVICE_API_URL": "",
-    "MOCHA_USERS_SERVICE_API_KEY": ""
+    "MOCHA_USERS_SERVICE_API_KEY": "",
+    "INFERENCE_SERVICE_URL": "http://127.0.0.1:8000",
+    "INFERENCE_SERVICE_API_KEY": "scanora-research-token-secure-2026"
   },
   "d1_databases": [
     {

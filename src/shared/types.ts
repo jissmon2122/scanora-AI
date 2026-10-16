@@ -18,9 +18,23 @@ export type Laterality = z.infer<typeof LateralitySchema>;
 export const MammographyViewSchema = z.enum(["CC", "MLO", "Other"]);
 export type MammographyView = z.infer<typeof MammographyViewSchema>;
 
+export const ModelStatusSchema = z.enum([
+  "TRAINED_MODEL",
+  "RESEARCH_PROTOTYPE",
+  "SIMULATED_DEMO",
+  "MODEL_UNAVAILABLE",
+]);
+export type ModelStatus = z.infer<typeof ModelStatusSchema>;
+
 export const LesionFindingSchema = z.object({
   id: z.string(),
-  type: z.enum(["Mass", "Microcalcification", "Architectural Distortion", "Asymmetry"]),
+  type: z.enum([
+    "Mass",
+    "Microcalcification",
+    "Suspicious Calcification",
+    "Architectural Distortion",
+    "Asymmetry",
+  ]),
   location: z.enum([
     "Upper Outer Quadrant",
     "Upper Inner Quadrant",
@@ -36,6 +50,14 @@ export const LesionFindingSchema = z.object({
       y: z.number(),
       width: z.number(),
       height: z.number(),
+      raw_pixels: z
+        .object({
+          xmin: z.number(),
+          ymin: z.number(),
+          xmax: z.number(),
+          ymax: z.number(),
+        })
+        .optional(),
     })
     .optional(),
 });
@@ -43,15 +65,22 @@ export type LesionFinding = z.infer<typeof LesionFindingSchema>;
 
 export const AnalysisResultSchema = z.object({
   scanId: z.string(),
+  modelStatus: ModelStatusSchema.default("RESEARCH_PROTOTYPE"),
+  modelArchitecture: z.string().optional(),
+  checkpointId: z.string().optional(),
   biradsCategory: BiradsCategorySchema,
   biradsDescription: z.string(),
   malignancyScore: z.number().min(0).max(100),
   benignScore: z.number().min(0).max(100),
+  calibratedProbability: z.number().optional(),
+  isIndeterminate: z.boolean().optional(),
   density: BreastDensitySchema,
   densityDescription: z.string(),
   findings: z.array(LesionFindingSchema),
   recommendation: z.string(),
   analyzedAt: z.string(),
+  inferenceLatencyMs: z.number().optional(),
+  disclaimer: z.string().optional(),
 });
 export type AnalysisResult = z.infer<typeof AnalysisResultSchema>;
 
@@ -66,6 +95,7 @@ export type PatientInfo = z.infer<typeof PatientInfoSchema>;
 
 export const ScanRecordSchema = z.object({
   id: z.string(),
+  userEmail: z.string().optional(),
   fileName: z.string(),
   fileSize: numberOrString(),
   previewUrl: z.string().optional(),
@@ -85,5 +115,6 @@ export const AnalyzeRequestSchema = z.object({
   fileSize: z.number().optional(),
   fileDataUrl: z.string().optional(),
   patientInfo: PatientInfoSchema.optional(),
+  allowDemoFallback: z.boolean().optional().default(false),
 });
 export type AnalyzeRequest = z.infer<typeof AnalyzeRequestSchema>;

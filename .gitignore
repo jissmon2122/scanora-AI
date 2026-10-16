@@ -3,3 +3,17 @@ node_modules/
 .wrangler/
 .dev.vars
 worker-configuration.d.ts
+
+# Python virtual environment & caches
+ai_service/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Large model binaries and medical datasets (stored securely)
+ai_service/checkpoints/*.pt
+ai_service/checkpoints/*.pth
+ai_service/checkpoints/*.bin
+ai_service/data/
+*.dcm
