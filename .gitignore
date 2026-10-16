@@ -2,7 +2,6 @@ dist/
 node_modules/
 .wrangler/
 .dev.vars
-worker-configuration.d.ts
 
 # Python virtual environment & caches
 ai_service/.venv/
