@@ -18,6 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import efficientnet_b2, EfficientNet_B2_Weights
 from ai_service.models.calibration import TemperatureScaler
+from ai_service.models.checkpoint_validator import (
+    CheckpointValidator,
+    ModelLifecycleState,
+    CheckpointValidationError,
+)
 
 
 class MammographyClassifier(nn.Module):
@@ -85,6 +90,7 @@ class MammographyClassifier(nn.Module):
         # Checkpoint provenance metadata
         self.checkpoint_id: Optional[str] = None
         self.is_trained: bool = False
+        self.lifecycle_state: str = ModelLifecycleState.MODEL_UNAVAILABLE
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -115,7 +121,14 @@ class MammographyClassifier(nn.Module):
         """
         Executes single-image inference and returns calibrated probabilities,
         density classification, and uncertainty assessment.
+        Blocks inference if model is untrained or checkpoint is absent.
         """
+        if not self.is_trained or self.lifecycle_state == ModelLifecycleState.MODEL_UNAVAILABLE:
+            raise RuntimeError(
+                "Inference blocked: No verified task-trained checkpoint is loaded. "
+                "Untrained random linear heads are strictly prohibited from generating clinical cancer risk scores."
+            )
+
         self.eval()
         tensor_input = tensor_1x1xHxW.to(device)
 
@@ -146,6 +159,7 @@ class MammographyClassifier(nn.Module):
 
         return {
             "model_architecture": self.backbone_name,
+            "lifecycle_state": self.lifecycle_state,
             "is_trained_checkpoint": self.is_trained,
             "checkpoint_id": self.checkpoint_id or "uncalibrated_baseline",
             "malignancy_score": round(mal_prob * 100.0, 2),
@@ -162,18 +176,14 @@ class MammographyClassifier(nn.Module):
         }
 
     def load_checkpoint(self, checkpoint_path: str, device: torch.device = torch.device("cpu")):
-        """Loads verified model weights and updates model provenance."""
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint file '{checkpoint_path}' does not exist.")
-
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            self.load_state_dict(checkpoint["state_dict"])
-            self.checkpoint_id = checkpoint.get("checkpoint_id", os.path.basename(checkpoint_path))
-        else:
-            self.load_state_dict(checkpoint)
-            self.checkpoint_id = os.path.basename(checkpoint_path)
-
+        """Loads and verifies task-specific model weights via CheckpointValidator."""
+        state_dict, checkpoint_id, lifecycle_state = CheckpointValidator.inspect_and_load(
+            checkpoint_path, device=device
+        )
+        self.load_state_dict(state_dict)
+        self.checkpoint_id = checkpoint_id
+        self.lifecycle_state = lifecycle_state
         self.is_trained = True
         self.to(device)
         self.eval()
+        return True

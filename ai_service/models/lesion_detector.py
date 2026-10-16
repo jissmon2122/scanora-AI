@@ -195,18 +195,30 @@ class MammographyLesionDetector(nn.Module):
         }
 
     def load_checkpoint(self, checkpoint_path: str, device: torch.device = torch.device("cpu")):
-        """Loads trained Faster R-CNN checkpoint."""
-        if not os.path.exists(checkpoint_path):
+        """Loads and verifies trained Faster R-CNN checkpoint."""
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Detector checkpoint '{checkpoint_path}' does not exist.")
 
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            self.load_state_dict(checkpoint["state_dict"])
+        file_size = os.path.getsize(checkpoint_path)
+        if file_size < 1024:
+            raise ValueError(f"Detector checkpoint '{checkpoint_path}' is corrupt or empty (size: {file_size} bytes).")
+
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        except Exception as e:
+            raise ValueError(f"Failed to deserialize detector checkpoint: {e}")
+
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Invalid detector checkpoint format. Expected dictionary.")
+
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
             self.checkpoint_id = checkpoint.get("checkpoint_id", os.path.basename(checkpoint_path))
         else:
-            self.load_state_dict(checkpoint)
+            state_dict = checkpoint
             self.checkpoint_id = os.path.basename(checkpoint_path)
 
+        self.load_state_dict(state_dict)
         self.is_trained = True
         self.to(device)
         self.eval()

@@ -90,6 +90,14 @@ def evaluate_validation(
     return {"val_auc": round(auc, 4), "samples": len(all_targets_arr)}
 
 
+def set_seed(seed: int = 42):
+    """Sets deterministic seed across PyTorch, NumPy, and CUDA."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def run_training(
     manifest_records: List[Dict[str, Any]],
     output_checkpoint_dir: str = "./ai_service/checkpoints",
@@ -97,8 +105,10 @@ def run_training(
     batch_size: int = 16,
     lr: float = 3e-4,
     device_str: str = "auto",
+    random_seed: int = 42,
 ):
     """Executes full training run with patient-isolated splits and checkpoint saving."""
+    set_seed(random_seed)
     os.makedirs(output_checkpoint_dir, exist_ok=True)
 
     if device_str == "auto":
@@ -106,10 +116,10 @@ def run_training(
     else:
         device = torch.device(device_str)
 
-    logger.info(f"Using compute device: {device}")
+    logger.info(f"Using compute device: {device} (Seed: {random_seed})")
 
     # Generate patient-isolated splits
-    train_recs, val_recs, test_recs = create_patient_isolated_splits(manifest_records)
+    train_recs, val_recs, test_recs = create_patient_isolated_splits(manifest_records, random_seed=random_seed)
     logger.info(
         f"Splits generated: Train={len(train_recs)} images, Val={len(val_recs)}, Test={len(test_recs)}"
     )
@@ -156,6 +166,11 @@ def run_training(
                     "val_auc": best_auc,
                     "checkpoint_id": f"effnet-b2-epoch{epoch}-auc{best_auc:.4f}",
                     "architecture": "efficientnet_b2_mammography",
+                    "task": "mammography_malignancy_density",
+                    "task_trained": True,
+                    "lifecycle_state": "RESEARCH_UNVALIDATED",
+                    "dataset_provenance": "VinDr-Mammo / CBIS-DDSM",
+                    "random_seed": random_seed,
                 },
                 best_checkpoint_path,
             )

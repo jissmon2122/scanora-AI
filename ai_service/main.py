@@ -22,6 +22,7 @@ from ai_service.preprocessing.dicom_handler import DicomHandler, DicomProcessing
 from ai_service.preprocessing.mammography_preprocessor import MammographyPreprocessor
 from ai_service.models.mammography_classifier import MammographyClassifier
 from ai_service.models.lesion_detector import MammographyLesionDetector
+from ai_service.models.checkpoint_validator import ModelLifecycleState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("scanora.inference_service")
@@ -134,10 +135,11 @@ def health():
         "version": "1.0.0",
         "device": str(device),
         "cuda_available": torch.cuda.is_available(),
-        "classifier_ready": True,
+        "classifier_ready": classifier.is_trained,
         "classifier_trained": classifier.is_trained,
         "classifier_checkpoint": classifier.checkpoint_id,
-        "detector_ready": True,
+        "lifecycle_state": classifier.lifecycle_state,
+        "detector_ready": detector.is_trained,
         "detector_trained": detector.is_trained,
         "detector_checkpoint": detector.checkpoint_id,
     }
@@ -145,12 +147,17 @@ def health():
 
 @app.get("/v1/model-info")
 def model_info():
-    """Returns architecture and training dataset provenance."""
+    """Returns architecture, lifecycle status, and training dataset provenance."""
     return {
+        "service": "Scanora Mammography AI Service",
+        "version": "1.0.0",
+        "lifecycle_state": classifier.lifecycle_state,
+        "is_trained": classifier.is_trained,
         "classifier": {
             "backbone": classifier.backbone_name,
             "trained": classifier.is_trained,
             "checkpoint": classifier.checkpoint_id,
+            "lifecycle_state": classifier.lifecycle_state,
             "dataset_provenance": "VinDr-Mammo (FFDM) / CBIS-DDSM",
         },
         "detector": {
@@ -170,6 +177,16 @@ def infer(req: InferenceRequest, authorization: Optional[str] = Header(None)):
     """Executes validated PyTorch computer vision inference."""
     verify_auth_token(authorization)
     start_time = time.perf_counter()
+
+    # Safety Gate: Prevent untrained random linear heads from generating clinical predictions
+    if not classifier.is_trained or classifier.lifecycle_state == ModelLifecycleState.MODEL_UNAVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "AI Model Unavailable: No verified mammography task-trained checkpoint is loaded. "
+                "Untrained random linear heads are strictly prohibited from generating clinical cancer risk scores."
+            ),
+        )
 
     # Decode base64 payload
     try:
@@ -232,7 +249,7 @@ def infer(req: InferenceRequest, authorization: Optional[str] = Header(None)):
 
     latency_ms = (time.perf_counter() - start_time) * 1000.0
 
-    model_status_label = "TRAINED_MODEL" if classifier.is_trained else "RESEARCH_PROTOTYPE"
+    model_status_label = classifier.lifecycle_state
 
     return InferenceResponse(
         scan_id=req.scan_id,

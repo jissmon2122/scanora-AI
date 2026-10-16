@@ -19,10 +19,12 @@ export const MammographyViewSchema = z.enum(["CC", "MLO", "Other"]);
 export type MammographyView = z.infer<typeof MammographyViewSchema>;
 
 export const ModelStatusSchema = z.enum([
-  "TRAINED_MODEL",
-  "RESEARCH_PROTOTYPE",
-  "SIMULATED_DEMO",
   "MODEL_UNAVAILABLE",
+  "RESEARCH_UNVALIDATED",
+  "VALIDATED_FOR_INTENDED_USE",
+  "SIMULATED_DEMO",
+  "RESEARCH_PROTOTYPE",
+  "TRAINED_MODEL",
 ]);
 export type ModelStatus = z.infer<typeof ModelStatusSchema>;
 

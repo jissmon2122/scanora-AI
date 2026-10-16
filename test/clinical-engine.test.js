@@ -104,6 +104,8 @@ test("ModelStatusSchema enforces valid AI transparency statuses", () => {
     "RESEARCH_PROTOTYPE",
     "SIMULATED_DEMO",
     "MODEL_UNAVAILABLE",
+    "RESEARCH_UNVALIDATED",
+    "VALIDATED_FOR_INTENDED_USE",
   ];
   for (const status of validStatuses) {
     assert.equal(ModelStatusSchema.parse(status), status);
@@ -111,4 +113,6 @@ test("ModelStatusSchema enforces valid AI transparency statuses", () => {
 
   assert.throws(() => ModelStatusSchema.parse("PROD_CERTIFIED"));
   assert.throws(() => ModelStatusSchema.parse("UNKNOWN"));
+  assert.throws(() => ModelStatusSchema.parse("MAGIC_ACCURACY"));
 });
+

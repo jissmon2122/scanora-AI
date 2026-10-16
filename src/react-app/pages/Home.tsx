@@ -290,26 +290,34 @@ export default function Home() {
 
   const getModelStatusBadge = (status?: ModelStatus) => {
     switch (status) {
-      case "TRAINED_MODEL":
+      case "VALIDATED_FOR_INTENDED_USE":
         return {
           bg: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
           dot: "bg-emerald-400 animate-pulse",
-          label: "Live AI Model (Trained)",
-          description: "Inference executed via local PyTorch microservice with trained weights.",
+          label: "Validated for Intended Use",
+          description: "Independently verified clinical evidence with authorized regulatory clearance.",
         };
+      case "RESEARCH_UNVALIDATED":
       case "RESEARCH_PROTOTYPE":
         return {
           bg: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
           dot: "bg-cyan-400",
-          label: "Research Prototype (Inference Active)",
-          description: "Pre-clinical deep learning model (EfficientNet-B2 + Faster R-CNN).",
+          label: "Research Prototype (Unvalidated)",
+          description: "Pre-clinical deep learning inference — Not cleared for primary clinical diagnosis.",
+        };
+      case "TRAINED_MODEL":
+        return {
+          bg: "bg-teal-500/15 text-teal-300 border-teal-500/30",
+          dot: "bg-teal-400",
+          label: "Trained Research Model",
+          description: "Fine-tuned task weights loaded. Pre-clinical evaluation required.",
         };
       case "SIMULATED_DEMO":
         return {
           bg: "bg-amber-500/15 text-amber-300 border-amber-500/30",
           dot: "bg-amber-400",
           label: "Demonstration / Simulation Mode",
-          description: "Deterministic clinical simulation (PyTorch inference service inactive).",
+          description: "Deterministic clinical simulation — NOT actual patient findings.",
         };
       case "MODEL_UNAVAILABLE":
       default:
@@ -317,7 +325,7 @@ export default function Home() {
           bg: "bg-rose-500/15 text-rose-300 border-rose-500/30",
           dot: "bg-rose-400",
           label: "AI Model Unavailable",
-          description: "Inference service offline or model weights missing.",
+          description: "Untrained random weights blocked / inference checkpoint missing.",
         };
     }
   };
