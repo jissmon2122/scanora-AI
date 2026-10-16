@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "019b3565-2664-7412-9b7b-2ed0b08b2bc6",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2025-06-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "upload_source_maps": true,
+  "assets": {
+    "not_found_handling": "single-page-application"
+  },
+  "vars": {
+    "MOCHA_USERS_SERVICE_API_URL": "",
+    "MOCHA_USERS_SERVICE_API_KEY": ""
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "019b3565-2664-7412-9b7b-2ed0b08b2bc6",
+      "database_id": "019b3565-2664-7412-9b7b-2ed0b08b2bc6"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2_BUCKET",
+      "bucket_name": "019b3565-2664-7412-9b7b-2ed0b08b2bc6"
+    }
+  ]
+}
