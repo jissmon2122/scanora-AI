@@ -1,10 +1,10 @@
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/auth";
 import { useNavigate } from "react-router";
 import { useEffect, useState } from "react";
 import { Activity, ShieldCheck, Stethoscope, ArrowRight, Sparkles } from "lucide-react";
 
 export default function LoginPage() {
-  const { user, redirectToLogin, isPending } = useAuth();
+  const { user, redirectToLogin, loginDemoSession, isPending } = useAuth();
   const navigate = useNavigate();
   const [isDemoStarting, setIsDemoStarting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -19,21 +19,17 @@ export default function LoginPage() {
     setIsDemoStarting(true);
     setErrorMessage(null);
     try {
-      const res = await fetch("/api/demo-session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-      });
-
-      if (res.ok) {
-        // Trigger page refresh or navigate so AuthProvider picks up the session
-        window.location.href = "/";
+      const res = await loginDemoSession();
+      if (res.success) {
+        navigate("/");
       } else {
-        const data = await res.json().catch(() => ({}));
-        setErrorMessage(data.error || "Failed to initiate clinician session.");
+        setErrorMessage("Failed to initiate clinician session.");
         setIsDemoStarting(false);
       }
-    } catch {
-      setErrorMessage("Network error starting clinician demo.");
+    } catch (err: unknown) {
+      setErrorMessage(
+        err instanceof Error ? err.message : "Network error starting clinician demo."
+      );
       setIsDemoStarting(false);
     }
   };

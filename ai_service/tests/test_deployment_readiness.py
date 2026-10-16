@@ -122,3 +122,119 @@ def test_inference_safety_gate_without_checkpoint_fails_fast():
     # Model instances should remain unallocated
     assert ModelManager._classifier is None
     assert ModelManager._detector is None
+
+
+def test_demo_session_post_success_and_sets_cookie():
+    """Verify that POST /api/demo-session sets session cookie and returns clinician user data."""
+    client = TestClient(app)
+    resp = client.post("/api/demo-session")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert "user" in data
+    assert data["user"]["email"] == "dr.clinician@scanora.health"
+    assert "scanora_demo_session" in resp.cookies
+
+
+def test_demo_session_get_returns_405_method_not_allowed():
+    """Confirm that GET /api/demo-session explicitly returns HTTP 405 Method Not Allowed."""
+    client = TestClient(app)
+    resp = client.get("/api/demo-session")
+
+    assert resp.status_code == 405
+    data = resp.json()
+    assert "detail" in data
+    assert "Method Not Allowed" in data["detail"]
+
+
+def test_users_me_authentication_lifecycle():
+    """Verify that GET /api/users/me returns 401 when unauthenticated and 200 when authenticated."""
+    client = TestClient(app)
+
+    # 1. Unauthenticated request must return 401
+    unauth_resp = client.get("/api/users/me")
+    assert unauth_resp.status_code == 401
+
+    # 2. Login via demo-session
+    login_resp = client.post("/api/demo-session")
+    assert login_resp.status_code == 200
+
+    # 3. Request with demo cookie must succeed
+    auth_resp = client.get("/api/users/me", cookies=login_resp.cookies)
+    assert auth_resp.status_code == 200
+    user_data = auth_resp.json()
+    assert user_data["email"] == "dr.clinician@scanora.health"
+
+    # 4. Logout must clear session
+    logout_resp = client.post("/api/logout", cookies=login_resp.cookies)
+    assert logout_resp.status_code == 200
+
+    # 5. Subsequent request should be 401
+    after_logout_resp = client.get("/api/users/me", cookies=logout_resp.cookies)
+    assert after_logout_resp.status_code == 401
+
+
+def test_cors_options_preflight_allows_vercel_domains():
+    """Verify CORS preflight allows Vercel production and preview deployments with credentials."""
+    client = TestClient(app)
+
+    origins_to_test = [
+        "https://scanora-ai.vercel.app",
+        "https://scanora.vercel.app",
+        "https://scanora-ai-git-master-jissmon2122s-projects.vercel.app",
+        "http://localhost:5173",
+    ]
+
+    for origin in origins_to_test:
+        resp = client.options(
+            "/api/demo-session",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        assert resp.status_code == 200, f"CORS preflight failed for origin {origin}"
+        assert resp.headers.get("access-control-allow-origin") == origin
+        assert resp.headers.get("access-control-allow-credentials") == "true"
+
+
+def test_clinical_scans_and_simulation_fallback():
+    """Verify listing scans, creating simulation fallback scan when model unavailable, and deleting."""
+    client = TestClient(app)
+
+    # Analyze request with allowDemoFallback=True
+    payload = {
+        "scanId": "test-demo-scan-123",
+        "fileName": "mammogram_sample.png",
+        "fileSize": 2048,
+        "allowDemoFallback": True,
+        "patientInfo": {
+            "patientId": "PAT-DEMO-99",
+            "age": 54,
+            "laterality": "right",
+            "view": "MLO",
+        },
+    }
+
+    analyze_resp = client.post("/api/scans/analyze", json=payload)
+    assert analyze_resp.status_code == 200
+    res_data = analyze_resp.json()
+    assert res_data["success"] is True
+    scan = res_data["scan"]
+    assert scan["id"] == "test-demo-scan-123"
+    assert scan["analysis"]["modelStatus"] == "SIMULATED_DEMO"
+    assert scan["analysis"]["checkpointId"] == "simulation-fallback"
+
+    # List scans must include the created scan
+    list_resp = client.get("/api/scans")
+    assert list_resp.status_code == 200
+    scans = list_resp.json()["scans"]
+    assert any(s["id"] == "test-demo-scan-123" for s in scans)
+
+    # Delete scan
+    del_resp = client.delete("/api/scans/test-demo-scan-123")
+    assert del_resp.status_code == 200
+    assert del_resp.json()["success"] is True
+

@@ -13,7 +13,7 @@ import base64
 import logging
 import threading
 from typing import Dict, Any, Optional, List
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import torch
@@ -41,10 +41,27 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS configuration
+# CORS configuration with explicit origins and Vercel preview regex
+default_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://scanora-ai.vercel.app",
+    "https://scanora.vercel.app",
+]
+
+env_origins = os.getenv("ALLOWED_ORIGINS", "")
+if env_origins:
+    for o in env_origins.split(","):
+        clean_o = o.strip()
+        if clean_o and clean_o not in default_origins:
+            default_origins.append(clean_o)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=default_origins,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -560,3 +577,340 @@ def infer(req: InferenceRequest, authorization: Optional[str] = Header(None)):
             "Not for independent primary diagnostic use."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Clinical Workstation API Endpoints (Vercel Frontend & Integration Layer)
+# ---------------------------------------------------------------------------
+
+DEMO_COOKIE_NAME = "scanora_demo_session"
+in_memory_scans: List[Dict[str, Any]] = []
+
+
+class PatientInfoPayload(BaseModel):
+    patientId: Optional[str] = None
+    age: Optional[int] = Field(default=None, ge=18, le=120)
+    laterality: Optional[str] = "right"
+    view: Optional[str] = "MLO"
+    notes: Optional[str] = None
+
+
+class AnalyzeScanRequest(BaseModel):
+    scanId: str
+    fileName: str
+    fileSize: Optional[int] = None
+    fileDataUrl: Optional[str] = None
+    patientInfo: Optional[PatientInfoPayload] = None
+    allowDemoFallback: Optional[bool] = False
+
+
+def generate_simulated_analysis(
+    scan_id: str,
+    file_name: str,
+    file_size: int = 1000,
+    age: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Generates deterministic clinical benchmark simulation strictly labeled as SIMULATED_DEMO."""
+    seed_str = f"{file_name}-{file_size}-{age or 45}"
+    h = 0
+    for char in seed_str:
+        h = ((h << 5) - h + ord(char)) & 0xFFFFFFFF
+        if h >= 0x80000000:
+            h -= 0x100000000
+    abs_hash = abs(h)
+    cat_sel = abs_hash % 100
+
+    if cat_sel < 45:
+        birads_cat = "BI-RADS 1"
+        birads_desc = "Negative — Symmetrical breast tissue without architectural distortion or suspicious masses."
+        mal_score = round(1.2 + (abs_hash % 15) / 10.0, 1)
+        ben_score = round(100.0 - mal_score, 1)
+        rec = "Routine annual screening mammography recommended."
+        findings: List[Dict[str, Any]] = []
+    elif cat_sel < 75:
+        birads_cat = "BI-RADS 2"
+        birads_desc = "Benign Findings — Involuting fibroadenoma or typical secretory calcification."
+        mal_score = round(2.8 + (abs_hash % 20) / 10.0, 1)
+        ben_score = round(100.0 - mal_score, 1)
+        rec = "Continue routine screening mammography. No biopsy or short-term follow-up required."
+        findings = []
+    elif cat_sel < 90:
+        birads_cat = "BI-RADS 3"
+        birads_desc = "Probably Benign — Well-circumscribed focal density; malignancy risk < 2%."
+        mal_score = round(4.5 + (abs_hash % 25) / 10.0, 1)
+        ben_score = round(100.0 - mal_score, 1)
+        rec = "Initial 6-month short-interval unilateral follow-up recommended."
+        findings = []
+    else:
+        birads_cat = "BI-RADS 4"
+        birads_desc = "Suspicious Abnormality — Indeterminate cluster or irregular microcalcifications."
+        mal_score = round(32.0 + (abs_hash % 40), 1)
+        ben_score = round(100.0 - mal_score, 1)
+        rec = "Image-guided tissue biopsy should be strongly considered."
+        findings = [
+            {
+                "id": f"sim-{scan_id}-1",
+                "type": "Microcalcification",
+                "location": "Upper Outer Quadrant",
+                "confidencePercent": 88.5,
+                "riskLevel": "Suspicious",
+                "coordinates": {"x": 42.0, "y": 30.0, "width": 14.0, "height": 14.0},
+            }
+        ]
+
+    density_options = [
+        ("A", "Entirely fatty tissue (ACR Density A)"),
+        ("B", "Scattered fibroglandular densities (ACR Density B)"),
+        ("C", "Heterogeneously dense tissue (ACR Density C)"),
+        ("D", "Extremely dense tissue (ACR Density D)"),
+    ]
+    chosen_density = density_options[(abs_hash >> 3) % len(density_options)]
+
+    return {
+        "scanId": scan_id,
+        "modelStatus": "SIMULATED_DEMO",
+        "modelArchitecture": "Synthetic Benchmark Estimator",
+        "checkpointId": "simulation-fallback",
+        "biradsCategory": birads_cat,
+        "biradsDescription": birads_desc,
+        "malignancyScore": mal_score,
+        "benignScore": ben_score,
+        "density": chosen_density[0],
+        "densityDescription": chosen_density[1],
+        "findings": findings,
+        "recommendation": rec,
+        "analyzedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "inferenceLatencyMs": 45.0,
+        "disclaimer": "DEMONSTRATION MODE: Simulated outputs. Connect the Python AI microservice for real deep learning inference.",
+    }
+
+
+@app.post("/api/demo-session")
+@app.post("/demo-session")
+def create_demo_session(request: Request, response: Response):
+    """
+    Initiates an authenticated Clinician Demo Session.
+    Sets session cookie and returns clinician user profile.
+    """
+    is_secure = request.url.scheme == "https" or os.getenv("COOKIE_SECURE", "false").lower() in ("true", "1")
+    response.set_cookie(
+        key=DEMO_COOKIE_NAME,
+        value="active",
+        max_age=60 * 60 * 24 * 7,
+        httponly=True,
+        samesite="none" if is_secure else "lax",
+        secure=is_secure,
+    )
+    return {
+        "success": True,
+        "message": "Demo Clinician session established.",
+        "user": {
+            "id": "demo-clinician",
+            "email": "dr.clinician@scanora.health",
+            "google_user_data": {
+                "name": "Dr. Alex Taylor, MD",
+                "email": "dr.clinician@scanora.health",
+                "email_verified": True,
+                "sub": "demo-clinician-sub",
+            },
+            "last_signed_in_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    }
+
+
+@app.get("/api/users/me")
+@app.get("/users/me")
+def get_current_user(request: Request):
+    """Returns authenticated clinician or user profile; checks cookie or Authorization header."""
+    cookie = request.cookies.get(DEMO_COOKIE_NAME)
+    auth_header = request.headers.get("Authorization", "")
+    if cookie == "active" or "demo-clinician" in auth_header or "scanora_demo_session" in auth_header:
+        return {
+            "id": "demo-clinician",
+            "email": "dr.clinician@scanora.health",
+            "google_user_data": {
+                "name": "Dr. Alex Taylor, MD",
+                "email": "dr.clinician@scanora.health",
+                "email_verified": True,
+                "sub": "demo-clinician-sub",
+            },
+            "last_signed_in_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: No active clinician or user session",
+    )
+
+
+@app.post("/api/logout")
+@app.get("/api/logout")
+@app.post("/logout")
+@app.get("/logout")
+def terminate_session(response: Response):
+    """Terminates session and clears cookie."""
+    response.delete_cookie(key=DEMO_COOKIE_NAME, path="/")
+    return {"success": True, "message": "Clinician session terminated."}
+
+
+@app.get("/api/scans")
+@app.get("/scans")
+def list_clinical_scans():
+    """Lists clinical scan records."""
+    return {"scans": in_memory_scans}
+
+
+@app.post("/api/scans/analyze")
+@app.post("/scans/analyze")
+def analyze_clinical_scan(req: AnalyzeScanRequest):
+    """Executes validated clinical scan analysis (real PyTorch model inference or explicit demo simulation)."""
+    start_time = time.perf_counter()
+    analysis: Optional[Dict[str, Any]] = None
+
+    # If model is available and image provided, perform real inference
+    if ModelManager.is_classifier_available() and req.fileDataUrl:
+        try:
+            raw_base64 = req.fileDataUrl
+            if "," in raw_base64:
+                raw_base64 = raw_base64.split(",")[1]
+            file_bytes = base64.b64decode(raw_base64)
+            fmt = ImageValidator.detect_format(file_bytes)
+            if fmt == SupportedImageFormat.UNSUPPORTED:
+                raise HTTPException(status_code=400, detail="Unsupported image format.")
+
+            laterality = (req.patientInfo.laterality if req.patientInfo and req.patientInfo.laterality else "right")
+            view = (req.patientInfo.view if req.patientInfo and req.patientInfo.view else "MLO")
+
+            if fmt == SupportedImageFormat.DICOM:
+                pixel_array, _ = DicomHandler.parse_dicom(file_bytes)
+                prep_res = preprocessor.preprocess(pixel_array)
+            else:
+                image, _ = ImageValidator.validate_and_load_raster(file_bytes)
+                prep_res = preprocessor.preprocess(image)
+
+            active_classifier = ModelManager.get_classifier()
+            device_target = ModelManager.get_device()
+            classification = active_classifier.predict_single(prep_res.tensor, device=device_target)
+
+            # Map to BI-RADS
+            prob = classification["calibrated_malignancy_probability"]
+            if prob < 0.02:
+                birads_cat = "BI-RADS 1"
+                birads_desc = "Negative — Symmetrical breast tissue, no suspicious lesion."
+                rec = "Routine annual screening mammography recommended."
+            elif prob < 0.08:
+                birads_cat = "BI-RADS 2"
+                birads_desc = "Benign Findings — Involuting fibroadenoma or secretory calcification."
+                rec = "Continue routine screening mammography."
+            elif prob < 0.20:
+                birads_cat = "BI-RADS 3"
+                birads_desc = "Probably Benign — Well-circumscribed focal density; low probability of malignancy."
+                rec = "Initial 6-month short-interval unilateral mammographic follow-up."
+            elif prob < 0.60:
+                birads_cat = "BI-RADS 4"
+                birads_desc = "Suspicious Abnormality — Indeterminate mass or clustered microcalcifications."
+                rec = "Targeted ultrasound and image-guided core biopsy strongly recommended."
+            else:
+                birads_cat = "BI-RADS 5"
+                birads_desc = "Highly Suggestive of Malignancy — High probability lesion (>95% risk)."
+                rec = "Urgent diagnostic biopsy and oncology multidisciplinary review."
+
+            # Detector
+            active_detector = ModelManager.get_detector()
+            if active_detector is not None:
+                det = active_detector.detect(prep_res.tensor, device=device_target, laterality=laterality)
+                raw_findings = det.get("findings", [])
+            else:
+                raw_findings = []
+
+            mapped_findings = []
+            for f in raw_findings:
+                raw_box = f["raw_model_box"]
+                coords = prep_res.map_box_to_original(
+                    raw_box["xmin"], raw_box["ymin"], raw_box["xmax"], raw_box["ymax"]
+                )
+                mapped_findings.append({
+                    "id": f["id"],
+                    "type": f["type"],
+                    "location": f["location"],
+                    "confidencePercent": f["confidencePercent"],
+                    "riskLevel": f["riskLevel"],
+                    "coordinates": coords,
+                })
+
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            analysis = {
+                "scanId": req.scanId,
+                "modelStatus": active_classifier.lifecycle_state,
+                "modelArchitecture": classification["model_architecture"],
+                "checkpointId": classification["checkpoint_id"],
+                "biradsCategory": birads_cat,
+                "biradsDescription": birads_desc,
+                "malignancyScore": classification["malignancy_score"],
+                "benignScore": classification["benign_score"],
+                "calibratedProbability": classification["calibrated_malignancy_probability"],
+                "isIndeterminate": classification["is_indeterminate_case"],
+                "density": classification["density"],
+                "densityDescription": classification["density_description"],
+                "findings": mapped_findings,
+                "recommendation": rec,
+                "analyzedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "inferenceLatencyMs": round(latency_ms, 2),
+                "disclaimer": "RESEARCH PROTOTYPE: Results generated by deep learning model for investigational use only. Not for independent primary diagnostic use.",
+            }
+        except Exception as e:
+            logger.warning(f"Model inference failed: {e}")
+            if not req.allowDemoFallback:
+                raise HTTPException(status_code=500, detail=f"Inference error: {e}")
+
+    # Fallback simulation if model unavailable and allowed
+    if analysis is None:
+        if req.allowDemoFallback:
+            age = req.patientInfo.age if req.patientInfo else None
+            analysis = generate_simulated_analysis(req.scanId, req.fileName, req.fileSize or 1000, age)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI Model Unavailable: No verified task-trained checkpoint is loaded and demo fallback was not requested.",
+            )
+
+    scan_record = {
+        "id": req.scanId,
+        "userEmail": "dr.clinician@scanora.health",
+        "fileName": req.fileName,
+        "fileSize": req.fileSize or 0,
+        "previewUrl": req.fileDataUrl,
+        "uploadedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "patientInfo": req.patientInfo.model_dump() if req.patientInfo else {
+            "laterality": "right",
+            "view": "MLO",
+        },
+        "analysis": analysis,
+    }
+    in_memory_scans.insert(0, scan_record)
+    return {"success": True, "scan": scan_record}
+
+
+@app.delete("/api/scans/{scan_id}")
+@app.delete("/scans/{scan_id}")
+def delete_clinical_scan(scan_id: str):
+    global in_memory_scans
+    in_memory_scans = [s for s in in_memory_scans if s.get("id") != scan_id]
+    return {"success": True, "message": f"Scan {scan_id} deleted."}
+
+
+@app.get("/api/oauth/google/redirect_url")
+def oauth_google_redirect():
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Google OAuth is not configured on this instance. Please use Clinician Demo Access.",
+    )
+
+
+@app.get("/api/health")
+def api_health():
+    return health()
+

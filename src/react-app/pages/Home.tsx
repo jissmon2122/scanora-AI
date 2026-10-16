@@ -1,4 +1,5 @@
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/auth";
+import { apiFetch } from "@/react-app/lib/api";
 import { useNavigate } from "react-router";
 import { useEffect, useState, useRef } from "react";
 import {
@@ -96,11 +97,8 @@ export default function Home() {
   const fetchScans = async () => {
     setIsLoadingHistory(true);
     try {
-      const res = await fetch("/api/scans");
-      if (res.ok) {
-        const data = await res.json();
-        setScanHistory(data.scans || []);
-      }
+      const data = await apiFetch<{ scans: ScanRecord[] }>("/api/scans");
+      setScanHistory(data.scans || []);
     } catch (err) {
       console.warn("Could not load scan history:", err);
     } finally {
@@ -207,18 +205,11 @@ export default function Home() {
         },
       };
 
-      const res = await fetch("/api/scans/analyze", {
+      const result = await apiFetch<{ success: boolean; scan?: ScanRecord }>("/api/scans/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
 
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || "Analysis failed on the server.");
-      }
-
-      const result = await res.json();
       if (result.success && result.scan) {
         setActiveScanRecord(result.scan);
         setCurrentAnalysis(result.scan.analysis || null);
@@ -274,12 +265,10 @@ export default function Home() {
   const handleConfirmDelete = async () => {
     if (!deletingScanId) return;
     try {
-      const res = await fetch(`/api/scans/${deletingScanId}`, { method: "DELETE" });
-      if (res.ok) {
-        setScanHistory((prev) => prev.filter((s) => s.id !== deletingScanId));
-        if (activeScanRecord?.id === deletingScanId) {
-          handleClear();
-        }
+      await apiFetch(`/api/scans/${deletingScanId}`, { method: "DELETE" });
+      setScanHistory((prev) => prev.filter((s) => s.id !== deletingScanId));
+      if (activeScanRecord?.id === deletingScanId) {
+        handleClear();
       }
     } catch (err) {
       console.warn("Delete error:", err);
@@ -332,12 +321,11 @@ export default function Home() {
 
   const handleLogout = async () => {
     try {
-      await fetch("/api/logout");
       await logout();
     } catch {
-      // Proceed even on network error
+      // Proceed even on error
     } finally {
-      window.location.href = "/login";
+      navigate("/login");
     }
   };
 
