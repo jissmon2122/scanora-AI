@@ -53,23 +53,38 @@ classifier = MammographyClassifier(pretrained_backbone=True).to(device)
 detector = MammographyLesionDetector(pretrained_backbone=True).to(device)
 
 # Attempt to load trained checkpoints if present
-CHECKPOINTS_DIR = os.getenv("SCANORA_CHECKPOINTS_DIR", "./ai_service/checkpoints")
-classifier_path = os.path.join(CHECKPOINTS_DIR, "best_mammography_classifier.pt")
-detector_path = os.path.join(CHECKPOINTS_DIR, "best_lesion_detector.pt")
+CHECKPOINTS_DIR = os.getenv("SCANORA_CHECKPOINTS_DIR")
+if not CHECKPOINTS_DIR or not os.path.exists(CHECKPOINTS_DIR):
+    file_relative_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+    CHECKPOINTS_DIR = file_relative_dir if os.path.exists(file_relative_dir) else "./ai_service/checkpoints"
 
-if os.path.exists(classifier_path):
-    try:
-        classifier.load_checkpoint(classifier_path, device=device)
-        logger.info(f"Loaded classifier checkpoint: {classifier_path}")
-    except Exception as e:
-        logger.warning(f"Could not load classifier checkpoint: {e}")
+classifier_candidates = [
+    os.path.join(CHECKPOINTS_DIR, "best_mammography_classifier.pt"),
+    os.path.join(CHECKPOINTS_DIR, "mammography_classifier.pt"),
+]
+detector_candidates = [
+    os.path.join(CHECKPOINTS_DIR, "best_lesion_detector.pt"),
+    os.path.join(CHECKPOINTS_DIR, "lesion_detector.pt"),
+]
 
-if os.path.exists(detector_path):
-    try:
-        detector.load_checkpoint(detector_path, device=device)
-        logger.info(f"Loaded detector checkpoint: {detector_path}")
-    except Exception as e:
-        logger.warning(f"Could not load detector checkpoint: {e}")
+for c_path in classifier_candidates:
+    if os.path.exists(c_path):
+        try:
+            classifier.load_checkpoint(c_path, device=device)
+            logger.info(f"Loaded classifier checkpoint: {c_path}")
+            break
+        except Exception as e:
+            logger.warning(f"Could not load classifier checkpoint from '{c_path}': {e}")
+
+for d_path in detector_candidates:
+    if os.path.exists(d_path):
+        try:
+            detector.load_checkpoint(d_path, device=device)
+            logger.info(f"Loaded detector checkpoint: {d_path}")
+            break
+        except Exception as e:
+            logger.warning(f"Could not load detector checkpoint from '{d_path}': {e}")
+
 
 
 # Request & Response Schemas

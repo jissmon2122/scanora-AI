@@ -2,8 +2,34 @@
 name = "scanora-ai"
 version = "1.0.0"
 description = "Scanora Research-Grade AI Mammography Analysis"
+authors = [{ name = "Scanora Team", email = "engineer@scanora.health" }]
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "numpy>=1.26.0,<3.0.0",
+    "pillow>=10.4.0",
+    "pydicom>=3.0.0",
+    "scikit-learn>=1.5.0",
+    "httpx>=0.28.0",
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[tool.poetry]
+packages = [{include = "ai_service"}]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
